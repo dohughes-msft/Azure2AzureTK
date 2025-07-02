@@ -1,10 +1,8 @@
 <#
 .SYNOPSIS
     Take a collection of given resource IDs and return the cost incurred during previous months,
-    grouped as needed. For this we use the Microsoft.CostManagement provider of each subscription.
-    Requires Az.CostManagement module 0.4.2 or later.
+    grouped as needed. For this we use CostManagement provider of each subscription.
     Requires ImportExcel module if Excel output is requested.
-    PS1> Install-Module -Name Az.CostManagement
     PS1> Install-Module -Name ImportExcel
 
 .PARAMETER startDate
@@ -54,10 +52,6 @@ if ($outputFormat -notin @("json", "csv", "excel", "console")) {
 }
 
 # Check if the needed modules are installed 
-if (-not (Get-Module -ListAvailable -Name Az.CostManagement)) {
-    Write-Error "Az.CostManagement module is not installed. Please install it using 'Install-Module -Name Az.CostManagement'."
-    exit 1
-}
 if ($outputFormat -eq "excel" -and -not (Get-Module -ListAvailable -Name ImportExcel)) {
     Write-Error "ImportExcel module is not installed. Please install it using 'Install-Module -Name ImportExcel'."
     exit 1
@@ -111,7 +105,7 @@ $grouping = @(
 
 $aggregation = @{
     PreTaxCost = @{
-        type = "Sum"
+        function = "Sum"
         name = "PreTaxCost"
     }
 }
@@ -123,6 +117,16 @@ if ($subscriptionIds.Count -eq 1) {
     $subscriptionIds = @($subscriptionIds) # If only one subscription ID is found, use it as an array
 }
 
+# Get the access token for passing in the header
+$azContext = Get-AzContext
+$azProfile = [Microsoft.Azure.Commands.Common.Authentication.Abstractions.AzureRmProfileProvider]::Instance.Profile
+$profileClient = New-Object -TypeName Microsoft.Azure.Commands.ResourceManager.Common.RMProfileClient -ArgumentList ($azProfile)
+$token = $profileClient.AcquireAccessToken($azContext.Subscription.TenantId)
+$authHeader = @{
+   'Content-Type'='application/json'
+   'Authorization'='Bearer ' + $token.AccessToken
+}
+
 # Group the resources by subscription and issue a cost management query for each subscription
 # This reduces the number of API calls and allows us to handle multiple subscriptions efficiently.
 
@@ -132,34 +136,47 @@ for ($subIndex = 0; $subIndex -lt $subscriptionIds.Count; $subIndex++) {
     $resourceIds = $resourceTable | Where-Object { $_.ResourceSubscriptionId -eq $subscriptionIds[$subIndex] } | Select-Object -ExpandProperty ResourceId
     Write-Output "Querying subscription $(${subIndex}+1) of $($subscriptionIds.Count): $($subscriptionIds[$subIndex])"
 
-    $dimensions = New-AzCostManagementQueryComparisonExpressionObject -Name 'ResourceId' -Value $resourceIds
-    $filter = New-AzCostManagementQueryFilterObject -Dimensions $dimensions
+    $filter = @{
+        dimensions = @{
+            name = "ResourceId"
+            operator = "In"
+            values = @($resourceIds)
+        }
+    }
+    
+    # Create the body of the request
+    $body = @{
+        type = $type
+        timeframe = $timeframe
+        timePeriod = @{
+            from = $startDate
+            to = $endDate
+        }
+        dataset = @{
+            granularity = $granularity
+            grouping = $grouping
+            aggregation = $aggregation
+            filter = $filter
+        }
+    } | ConvertTo-Json -Depth 10
 
-    $queryResult = Invoke-AzCostManagementQuery `
-        -Scope $scope `
-        -Timeframe $timeframe `
-        -Type $type `
-        -TimePeriodFrom $startDate `
-        -TimePeriodTo $endDate `
-        -DatasetAggregation $aggregation `
-        -DatasetGrouping $grouping `
-        -DatasetFilter $filter
-        # -DatasetGranularity $granularity
+    $uri = "https://management.azure.com$scope/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
+    $queryResult = Invoke-RestMethod -Uri $uri -Method Post -Headers $authHeader -Body $body
 
     # Convert the query result into a table
-    for ($i = 0; $i -lt $queryResult.Row.Count; $i++) {
+    for ($i = 0; $i -lt $queryResult.properties.rows.Count; $i++) {
         $row = [PSCustomObject]@{}
-        for ($j = 0; $j -lt $queryResult.Column.Count; $j++) {
+        for ($j = 0; $j -lt $queryResult.properties.columns.Count; $j++) {
             # For column BillingMonth we output it as yyyy-MM
-            if ($queryResult.Column.Name[$j] -eq "BillingMonth" -and $queryResult.Column.Type[$j] -eq "Datetime") {
-                $value = Get-Date $queryResult.Row[$i][$j] -Format "yyyy-MM"
+            if ($queryResult.properties.columns[$j].name -eq "BillingMonth" -and $queryResult.properties.columns[$j].type -eq "Datetime") {
+                $value = Get-Date $queryResult.properties.rows[$i][$j] -Format "yyyy-MM"
             } else {
-                $value = $queryResult.Row[$i][$j]
+                $value = $queryResult.properties.rows[$i][$j]
             }
-            $row | Add-Member -MemberType NoteProperty -Name $queryResult.Column.Name[$j] -Value $value
+            $row | Add-Member -MemberType NoteProperty -Name $queryResult.properties.columns[$j].name -Value $value
         }
         $table += $row
-    }    
+    }
 }
 
 switch ($outputFormat) {
